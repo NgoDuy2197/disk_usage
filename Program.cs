@@ -373,6 +373,7 @@ namespace DiskUsage
             Size = new Size(1280, 800);
             MinimumSize = new Size(960, 620);
             StartPosition = FormStartPosition.CenterScreen;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
             BuildToolbar();
             BuildTabs();
@@ -578,7 +579,7 @@ namespace DiskUsage
             imgTop.Controls.Add(cboMinSize);
             imgTop.Controls.Add(btnMore);
 
-            imgList = new ImageList { ImageSize = new Size(110, 110), ColorDepth = ColorDepth.Depth32Bit };
+            imgList = NewImageList();
             lvImages = new ListView
             {
                 Dock = DockStyle.Fill, View = View.LargeIcon,
@@ -599,6 +600,29 @@ namespace DiskUsage
             tabs.TabPages.Add(tpTree);
             tabs.TabPages.Add(tpSum);
             tabs.TabPages.Add(tpImg);
+        }
+
+        // Tao ImageList va ep tao handle ngay: khi handle da ton tai, Images.Add se
+        // copy bitmap vao native list tuc thi -> Dispose bitmap goc an toan, va khong
+        // con su kien doi handle muon (nguon goc loi NullReferenceException o tab anh).
+        static ImageList NewImageList()
+        {
+            var il = new ImageList { ImageSize = new Size(110, 110), ColorDepth = ColorDepth.Depth32Bit };
+            IntPtr force = il.Handle;
+            return il;
+        }
+
+        // Thay vi Clear() (gay tai tao handle khi ListView con item), tao ImageList moi
+        void ResetImageList()
+        {
+            lvImages.BeginUpdate();
+            lvImages.Items.Clear();
+            lvImages.LargeImageList = null;
+            var old = imgList;
+            imgList = NewImageList();
+            lvImages.LargeImageList = imgList;
+            lvImages.EndUpdate();
+            if (old != null) old.Dispose();
         }
 
         static ListView MakeListView(string[] cols, int[] widths)
@@ -655,16 +679,31 @@ namespace DiskUsage
 
             using (var bg = new SolidBrush(Color.White)) g.FillRectangle(bg, row);
 
-            // thanh dung luong theo % cua thu muc cha
+            // thanh dung luong theo % cua thu muc cha (bo goc, gradient nhe kieu Aero)
             int barW = (int)(row.Width * Math.Min(1.0, ni.Pct));
-            if (barW > 1)
+            if (barW > 6)
             {
                 var barRect = new Rectangle(row.X, row.Y + 3, barW, row.Height - 6);
                 Color c = ni.IsFiles ? Color.FromArgb(150, 160, 172) : Aero.PctColor(ni.Pct);
-                using (var br = new SolidBrush(Color.FromArgb(52, c)))
-                    g.FillRectangle(br, barRect);
-                using (var edge = new SolidBrush(Color.FromArgb(170, c)))
-                    g.FillRectangle(edge, new Rectangle(barRect.X, barRect.Y, Math.Min(3, barW), barRect.Height));
+                var oldSm = g.SmoothingMode;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var path = Aero.Rounded(barRect, 4))
+                {
+                    using (var br = new LinearGradientBrush(barRect,
+                        Color.FromArgb(75, c), Color.FromArgb(38, c), LinearGradientMode.Vertical))
+                        g.FillPath(br, path);
+                    var half = new Rectangle(barRect.X, barRect.Y, barRect.Width, barRect.Height / 2);
+                    if (half.Height > 0)
+                        using (var region = new Region(path))
+                        {
+                            region.Intersect(half);
+                            using (var shine = new SolidBrush(Color.FromArgb(48, 255, 255, 255)))
+                                g.FillRegion(shine, region);
+                        }
+                    using (var pen = new Pen(Color.FromArgb(130, c)))
+                        g.DrawPath(pen, path);
+                }
+                g.SmoothingMode = oldSm;
             }
 
             if (sel) Aero.DrawSelection(g, row); // vien chon kieu Aero
@@ -725,8 +764,7 @@ namespace DiskUsage
             lvBigFiles.Items.Clear();
             lvExt.Items.Clear();
             imgGen++;
-            lvImages.Items.Clear();
-            imgList.Images.Clear();
+            ResetImageList();
             allImages.Clear();
             filteredImages.Clear();
             loadedImages = 0;
@@ -1016,10 +1054,7 @@ namespace DiskUsage
             imgGen++;
             long min = MinSizes[Math.Max(0, cboMinSize.SelectedIndex)];
             filteredImages = allImages.Where(delegate(FileEntry f) { return f.Size >= min; }).ToList();
-            lvImages.BeginUpdate();
-            lvImages.Items.Clear();
-            imgList.Images.Clear();
-            lvImages.EndUpdate();
+            ResetImageList();
             loadedImages = 0;
             UpdateImgCount();
             btnMore.Enabled = filteredImages.Count > 0;
