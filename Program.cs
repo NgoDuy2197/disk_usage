@@ -342,11 +342,15 @@ namespace DiskUsage
         Panel driveBar;
         ListView lvFolders, lvBigFiles, lvExt;
 
-        ListView lvImages;
-        ImageList imgList;
+        ThumbGrid grid;
         ComboBox cboMinSize;
-        Button btnMore;
         Label lblImgCount;
+        NumericUpDown numPageSize, numPage;
+        Button btnPrev, btnNext;
+        Label lblPageTotal;
+        int pageIndex;
+        int pageStart;   // index cua anh dau trang trong filteredImages
+        bool pageGuard;  // chan ValueChanged khi tu cap nhat numPage
 
         Scanner scanner;
         CancellationTokenSource cts;
@@ -357,9 +361,6 @@ namespace DiskUsage
 
         List<FileEntry> allImages = new List<FileEntry>();
         List<FileEntry> filteredImages = new List<FileEntry>();
-        int loadedImages;
-        bool thumbBusy;
-        int imgGen; // chong tre khi quet lai trong luc dang tao thumbnail
 
         long driveTotal, driveFree;
 
@@ -387,6 +388,13 @@ namespace DiskUsage
             uiTimer.Tick += delegate { UpdateProgress(); };
 
             LoadDrives();
+
+            // Nap cache anh cua duong dan dang chon (sau khi form co handle)
+            cboDrive.SelectedIndexChanged += delegate
+            {
+                if (!scanning && IsHandleCreated) TryLoadImageCache();
+            };
+            Load += delegate { TryLoadImageCache(); };
         }
 
         // ------------------------------------------------------------ Toolbar
@@ -568,61 +576,92 @@ namespace DiskUsage
                 { "Tất cả kích cỡ", "≥ 100 KB", "≥ 500 KB", "≥ 1 MB", "≥ 5 MB" });
             cboMinSize.SelectedIndex = 1;
             cboMinSize.SelectedIndexChanged += delegate { ApplyImageFilter(); };
-            btnMore = new Button
+
+            var lblPs = new Label
             {
-                Text = "Tải thêm 200 ảnh", Width = 140, Height = 26,
+                Text = "Ảnh/trang:", AutoSize = true, Margin = new Padding(0, 6, 4, 0),
+                ForeColor = Aero.TextMain
+            };
+            numPageSize = new NumericUpDown
+            {
+                Minimum = 10, Maximum = 2000, Value = 200, Increment = 50,
+                Width = 65, Margin = new Padding(0, 3, 14, 0),
+                TextAlign = HorizontalAlignment.Right
+            };
+            numPageSize.ValueChanged += delegate { if (!pageGuard) ShowPage(0); };
+
+            btnPrev = new Button
+            {
+                Text = "◀", Width = 34, Height = 26, Margin = new Padding(0, 1, 4, 0),
                 FlatStyle = FlatStyle.System, Enabled = false
             };
-            btnMore.Click += delegate { LoadMoreThumbs(); };
+            btnPrev.Click += delegate { ShowPage(pageIndex - 1); };
+            numPage = new NumericUpDown
+            {
+                Minimum = 1, Maximum = 1, Value = 1,
+                Width = 60, Margin = new Padding(0, 3, 4, 0),
+                TextAlign = HorizontalAlignment.Right
+            };
+            numPage.ValueChanged += delegate { if (!pageGuard) ShowPage((int)numPage.Value - 1); };
+            lblPageTotal = new Label
+            {
+                Text = "/ 1 trang", AutoSize = true, Margin = new Padding(0, 6, 4, 0),
+                ForeColor = Aero.TextMain
+            };
+            btnNext = new Button
+            {
+                Text = "▶", Width = 34, Height = 26, Margin = new Padding(0, 1, 0, 0),
+                FlatStyle = FlatStyle.System, Enabled = false
+            };
+            btnNext.Click += delegate { ShowPage(pageIndex + 1); };
 
             imgTop.Controls.Add(lblImgCount);
             imgTop.Controls.Add(cboMinSize);
-            imgTop.Controls.Add(btnMore);
+            imgTop.Controls.Add(lblPs);
+            imgTop.Controls.Add(numPageSize);
+            imgTop.Controls.Add(btnPrev);
+            imgTop.Controls.Add(numPage);
+            imgTop.Controls.Add(lblPageTotal);
+            imgTop.Controls.Add(btnNext);
 
-            imgList = NewImageList();
-            lvImages = new ListView
+            grid = new ThumbGrid { Dock = DockStyle.Fill };
+            grid.ItemActivate += delegate(int idx)
             {
-                Dock = DockStyle.Fill, View = View.LargeIcon,
-                LargeImageList = imgList, BackColor = Color.White,
-                BorderStyle = BorderStyle.None, ShowItemToolTips = true
-            };
-            lvImages.DoubleClick += delegate
-            {
-                if (lvImages.SelectedIndices.Count > 0)
-                    using (var f = new PreviewForm(filteredImages, lvImages.SelectedIndices[0]))
+                int g = pageStart + idx;
+                if (g >= 0 && g < filteredImages.Count)
+                    using (var f = new PreviewForm(filteredImages, g))
                         f.ShowDialog(this);
             };
-            EnableDoubleBuffer(lvImages);
+            var cmsImg = new ContextMenuStrip();
+            cmsImg.Items.Add("Xem ảnh", null, delegate
+            {
+                var fe = SelectedImage();
+                if (fe != null)
+                    using (var f = new PreviewForm(filteredImages, pageStart + grid.SelectedIndex))
+                        f.ShowDialog(this);
+            });
+            cmsImg.Items.Add("Mở trong Explorer", null, delegate
+            {
+                var fe = SelectedImage();
+                if (fe != null) TrySelectInExplorer(fe.Path);
+            });
+            cmsImg.Items.Add("Sao chép đường dẫn", null, delegate
+            {
+                var fe = SelectedImage();
+                if (fe != null) try { Clipboard.SetText(fe.Path); } catch { }
+            });
+            cmsImg.Opening += delegate(object s, System.ComponentModel.CancelEventArgs e)
+            {
+                if (SelectedImage() == null) e.Cancel = true;
+            };
+            grid.ContextMenuStrip = cmsImg;
 
-            tpImg.Controls.Add(lvImages);
+            tpImg.Controls.Add(grid);
             tpImg.Controls.Add(imgTop);
 
             tabs.TabPages.Add(tpTree);
             tabs.TabPages.Add(tpSum);
             tabs.TabPages.Add(tpImg);
-        }
-
-        // Tao ImageList va ep tao handle ngay: khi handle da ton tai, Images.Add se
-        // copy bitmap vao native list tuc thi -> Dispose bitmap goc an toan, va khong
-        // con su kien doi handle muon (nguon goc loi NullReferenceException o tab anh).
-        static ImageList NewImageList()
-        {
-            var il = new ImageList { ImageSize = new Size(110, 110), ColorDepth = ColorDepth.Depth32Bit };
-            IntPtr force = il.Handle;
-            return il;
-        }
-
-        // Thay vi Clear() (gay tai tao handle khi ListView con item), tao ImageList moi
-        void ResetImageList()
-        {
-            lvImages.BeginUpdate();
-            lvImages.Items.Clear();
-            lvImages.LargeImageList = null;
-            var old = imgList;
-            imgList = NewImageList();
-            lvImages.LargeImageList = imgList;
-            lvImages.EndUpdate();
-            if (old != null) old.Dispose();
         }
 
         static ListView MakeListView(string[] cols, int[] widths)
@@ -763,12 +802,9 @@ namespace DiskUsage
             lvFolders.Items.Clear();
             lvBigFiles.Items.Clear();
             lvExt.Items.Clear();
-            imgGen++;
-            ResetImageList();
             allImages.Clear();
             filteredImages.Clear();
-            loadedImages = 0;
-            btnMore.Enabled = false;
+            ShowPage(0);
             lblImgCount.Text = "Đang quét…";
             lblInfo.Text = "Đang quét, vui lòng chờ…";
             driveTotal = driveFree = 0;
@@ -1046,95 +1082,394 @@ namespace DiskUsage
         {
             allImages = scanner.Images.ToList();
             allImages.Sort(delegate(FileEntry a, FileEntry b) { return b.Size.CompareTo(a.Size); });
+            SaveImageCache(scanPath, allImages);
             ApplyImageFilter();
+        }
+
+        FileEntry SelectedImage()
+        {
+            int idx = pageStart + grid.SelectedIndex;
+            return grid.SelectedIndex >= 0 && idx < filteredImages.Count ? filteredImages[idx] : null;
         }
 
         void ApplyImageFilter()
         {
-            imgGen++;
             long min = MinSizes[Math.Max(0, cboMinSize.SelectedIndex)];
             filteredImages = allImages.Where(delegate(FileEntry f) { return f.Size >= min; }).ToList();
-            ResetImageList();
-            loadedImages = 0;
+            ShowPage(0);
+        }
+
+        int PageSize { get { return (int)numPageSize.Value; } }
+        int PageCount
+        {
+            get { return Math.Max(1, (filteredImages.Count + PageSize - 1) / PageSize); }
+        }
+
+        void ShowPage(int p)
+        {
+            p = Math.Max(0, Math.Min(PageCount - 1, p));
+            pageIndex = p;
+            pageStart = p * PageSize;
+            grid.SetItems(filteredImages.Skip(pageStart).Take(PageSize).ToList());
+
+            pageGuard = true;
+            numPage.Maximum = PageCount;
+            numPage.Value = p + 1;
+            pageGuard = false;
+            lblPageTotal.Text = string.Format("/ {0:N0} trang", PageCount);
+            btnPrev.Enabled = p > 0;
+            btnNext.Enabled = p < PageCount - 1;
             UpdateImgCount();
-            btnMore.Enabled = filteredImages.Count > 0;
-            if (filteredImages.Count > 0) LoadMoreThumbs();
         }
 
         void UpdateImgCount()
         {
-            lblImgCount.Text = string.Format("{0:N0} ảnh (đang hiển thị {1:N0})",
-                filteredImages.Count, loadedImages);
+            if (filteredImages.Count == 0)
+            {
+                lblImgCount.Text = "0 ảnh.";
+                return;
+            }
+            int last = Math.Min(filteredImages.Count, pageStart + PageSize);
+            lblImgCount.Text = string.Format("{0:N0} ảnh · hiển thị {1:N0}–{2:N0}",
+                filteredImages.Count, pageStart + 1, last);
         }
 
-        void LoadMoreThumbs()
+        // ------------------------------------------------- Cache danh sach anh
+        // Luu danh sach anh cua lan quet vao %TEMP% de lan sau mo app nap lai ngay
+        static string ImageCacheFile(string path)
         {
-            if (thumbBusy) return;
-            var batch = filteredImages.Skip(loadedImages).Take(200).ToList();
-            if (batch.Count == 0) { btnMore.Enabled = false; return; }
-            thumbBusy = true;
-            btnMore.Text = "Đang tải…";
-            int gen = imgGen;
+            string key = path.TrimEnd('\\').ToLowerInvariant();
+            uint h = 2166136261;
+            foreach (char c in key) { h ^= c; h *= 16777619; }
+            return Path.Combine(Path.GetTempPath(), "DiskUsage_img_" + h.ToString("x8") + ".txt");
+        }
 
+        static void SaveImageCache(string path, List<FileEntry> images)
+        {
+            var snapshot = images;
             Task.Run(delegate
             {
-                var thumbs = new List<KeyValuePair<FileEntry, Bitmap>>();
-                foreach (var fe in batch)
+                try
                 {
-                    if (gen != imgGen) break;
-                    thumbs.Add(new KeyValuePair<FileEntry, Bitmap>(fe, MakeThumb(fe.Path, 110, 110)));
+                    using (var w = new StreamWriter(ImageCacheFile(path), false, System.Text.Encoding.UTF8))
+                    {
+                        w.WriteLine(path);
+                        w.WriteLine(DateTime.Now.Ticks);
+                        foreach (var fe in snapshot) w.WriteLine(fe.Size + "|" + fe.Path);
+                    }
                 }
+                catch { }
+            });
+        }
+
+        void TryLoadImageCache()
+        {
+            var item = cboDrive.SelectedItem as DriveItem;
+            if (item == null) return;
+            try
+            {
+                string file = ImageCacheFile(item.Path);
+                if (!File.Exists(file)) return;
+                var list = new List<FileEntry>();
+                DateTime when = DateTime.MinValue;
+                using (var r = new StreamReader(file, System.Text.Encoding.UTF8))
+                {
+                    r.ReadLine(); // duong dan goc
+                    long ticks;
+                    if (long.TryParse(r.ReadLine(), out ticks)) when = new DateTime(ticks);
+                    string line;
+                    while ((line = r.ReadLine()) != null)
+                    {
+                        int sep = line.IndexOf('|');
+                        if (sep <= 0) continue;
+                        long sz;
+                        if (!long.TryParse(line.Substring(0, sep), out sz)) continue;
+                        list.Add(new FileEntry { Path = line.Substring(sep + 1), Size = sz });
+                    }
+                }
+                if (list.Count == 0) return;
+                allImages = list; // da sap xep giam dan khi luu
+                ApplyImageFilter();
+                lblStatus.Text = string.Format(
+                    "Đã nạp {0:N0} ảnh từ cache{1} — bấm Quét để cập nhật dữ liệu mới.",
+                    list.Count,
+                    when > DateTime.MinValue ? " (quét lúc " + when.ToString("dd/MM/yyyy HH:mm") + ")" : "");
+            }
+            catch { }
+        }
+
+        // ------------------------------------------------------------- Utils
+        static void TryOpenExplorer(string path)
+        {
+            try { Process.Start("explorer.exe", "\"" + path + "\""); } catch { }
+        }
+
+        static void TrySelectInExplorer(string path)
+        {
+            try { Process.Start("explorer.exe", "/select,\"" + path + "\""); } catch { }
+        }
+    }
+
+    // ------------------------------------------------------------- ThumbGrid
+    // Luoi anh "ao": hien thi hang chuc nghin anh khong lag. Danh sach chi giu
+    // duong dan (rat nhe); thumbnail chi duoc giai ma cho vung dang nhin thay
+    // (+ prefetch vai hang), cache LRU co gioi han va tu giai phong bitmap
+    // ngoai vung nhin. Cuon toi dau, anh tu tai toi do.
+    class ThumbGrid : Control
+    {
+        public event Action<int> ItemActivate;
+
+        const int CellW = 128, CellH = 152, Thumb = 110;
+        const int CacheMax = 900; // so thumbnail giu trong RAM (~40 MB)
+        static readonly int MaxWorkers = Math.Max(2, Math.Min(4, Environment.ProcessorCount - 1));
+
+        List<FileEntry> items = new List<FileEntry>();
+        readonly Dictionary<int, Bitmap> cache = new Dictionary<int, Bitmap>();
+        readonly LinkedList<int> lru = new LinkedList<int>();
+        readonly Dictionary<int, LinkedListNode<int>> lruMap = new Dictionary<int, LinkedListNode<int>>();
+        readonly HashSet<int> pending = new HashSet<int>();
+        readonly object sync = new object();
+        int workers;
+        int gen;            // tang moi lan SetItems -> huy ket qua tai tre
+        volatile int anchor; // index dau vung nhin, de uu tien tai & don cache
+
+        int selected = -1;
+        int scrollY;
+        VScrollBar vbar;
+        ToolTip tip = new ToolTip();
+        int tipIndex = -1;
+
+        public ThumbGrid()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            BackColor = Color.White;
+            vbar = new VScrollBar { Dock = DockStyle.Right };
+            vbar.ValueChanged += delegate { scrollY = vbar.Value; Invalidate(); };
+            Controls.Add(vbar);
+        }
+
+        public int SelectedIndex { get { return selected; } }
+
+        public void SetItems(List<FileEntry> list)
+        {
+            gen++;
+            items = list ?? new List<FileEntry>();
+            selected = -1;
+            tipIndex = -1;
+            anchor = 0;
+            lock (sync) pending.Clear();
+            foreach (var b in cache.Values) if (b != null) b.Dispose();
+            cache.Clear(); lru.Clear(); lruMap.Clear();
+            scrollY = 0;
+            UpdateScroll();
+            Invalidate();
+        }
+
+        // ------------------------------------------------------------ Layout
+        int ColsCount
+        {
+            get
+            {
+                int w = ClientSize.Width - vbar.Width - 8;
+                return Math.Max(1, w / CellW);
+            }
+        }
+
+        int TotalHeight
+        {
+            get
+            {
+                int rows = (items.Count + ColsCount - 1) / ColsCount;
+                return rows * CellH + 8;
+            }
+        }
+
+        void UpdateScroll()
+        {
+            int total = TotalHeight;
+            int page = Math.Max(1, ClientSize.Height);
+            int max = Math.Max(0, total - page);
+            if (scrollY > max) scrollY = max;
+            vbar.Minimum = 0;
+            vbar.Maximum = Math.Max(0, total - 1);
+            vbar.LargeChange = page;
+            vbar.SmallChange = CellH / 2;
+            vbar.Enabled = max > 0;
+            if (vbar.Value != scrollY) vbar.Value = scrollY;
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            UpdateScroll();
+        }
+
+        Rectangle CellRect(int i)
+        {
+            int cols = ColsCount;
+            return new Rectangle(4 + (i % cols) * CellW, 4 + (i / cols) * CellH - scrollY, CellW, CellH);
+        }
+
+        void VisibleRange(out int lo, out int hi)
+        {
+            if (items.Count == 0) { lo = 0; hi = -1; return; }
+            int cols = ColsCount;
+            int rowTop = Math.Max(0, (scrollY - 4) / CellH);
+            int rowBot = Math.Max(0, (scrollY + ClientSize.Height - 4) / CellH);
+            lo = Math.Min(rowTop * cols, items.Count - 1);
+            hi = Math.Min(items.Count - 1, (rowBot + 1) * cols - 1);
+            anchor = lo;
+        }
+
+        // -------------------------------------------------------------- Ve
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Color.White);
+            if (items.Count == 0)
+            {
+                TextRenderer.DrawText(g, "Không có ảnh.", Font, ClientRectangle,
+                    Aero.TextDim, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                return;
+            }
+            int lo, hi;
+            VisibleRange(out lo, out hi);
+            for (int i = lo; i <= hi; i++) DrawCell(g, i);
+            RequestRange(lo, hi);
+        }
+
+        void DrawCell(Graphics g, int i)
+        {
+            var cell = CellRect(i);
+            var thumbRect = new Rectangle(cell.X + (CellW - Thumb) / 2, cell.Y + 4, Thumb, Thumb);
+
+            if (i == selected) Aero.DrawSelection(g, cell);
+
+            Bitmap bmp;
+            bool have = cache.TryGetValue(i, out bmp);
+            if (have && bmp != null)
+            {
+                g.DrawImage(bmp, thumbRect);
+                Touch(i);
+            }
+            else
+            {
+                using (var br = new SolidBrush(Color.FromArgb(238, 242, 246)))
+                    g.FillRectangle(br, thumbRect);
+                // "…" = dang tai, "✕" = doc loi (tep hong/da xoa)
+                TextRenderer.DrawText(g, have ? "✕" : "…", Font, thumbRect, Aero.TextDim,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            }
+            using (var pen = new Pen(Color.FromArgb(214, 222, 230)))
+                g.DrawRectangle(pen, thumbRect);
+
+            var fe = items[i];
+            var nameRect = new Rectangle(cell.X + 3, thumbRect.Bottom + 3, CellW - 6, 16);
+            TextRenderer.DrawText(g, Path.GetFileName(fe.Path), Font, nameRect, Aero.TextMain,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            var sizeRect = new Rectangle(cell.X + 3, nameRect.Bottom, CellW - 6, 15);
+            TextRenderer.DrawText(g, Util.FormatSize(fe.Size), Font, sizeRect, Aero.TextDim,
+                TextFormatFlags.HorizontalCenter);
+        }
+
+        // ----------------------------------------------------- Tai thumbnail
+        void RequestRange(int lo, int hi)
+        {
+            if (hi < lo) return;
+            int pre = ColsCount * 3; // prefetch vai hang truoc/sau de cuon muot
+            int a = Math.Max(0, lo - pre), b = Math.Min(items.Count - 1, hi + pre);
+            lock (sync)
+            {
+                for (int i = a; i <= b; i++)
+                    if (!cache.ContainsKey(i)) pending.Add(i);
+                while (workers < MaxWorkers && pending.Count > 0)
+                {
+                    workers++;
+                    Task.Run((Action)PumpLoader);
+                }
+            }
+        }
+
+        void PumpLoader()
+        {
+            while (true)
+            {
+                int idx = -1, g;
+                string path = null;
+                lock (sync)
+                {
+                    g = gen;
+                    if (pending.Count > 0)
+                    {
+                        int anc = anchor, best = int.MaxValue;
+                        foreach (int p in pending)
+                        {
+                            int d = Math.Abs(p - anc);
+                            if (d < best) { best = d; idx = p; }
+                        }
+                        pending.Remove(idx);
+                        var list = items;
+                        if (idx >= 0 && idx < list.Count) path = list[idx].Path;
+                    }
+                    if (path == null) { workers--; return; }
+                }
+
+                var bmp = MakeThumb(path, Thumb, Thumb);
                 try
                 {
                     BeginInvoke((Action)delegate
                     {
-                        if (gen != imgGen)
-                        {
-                            foreach (var kv in thumbs) if (kv.Value != null) kv.Value.Dispose();
-                        }
-                        else
-                        {
-                            lvImages.BeginUpdate();
-                            foreach (var kv in thumbs)
-                            {
-                                int idx = imgList.Images.Count;
-                                imgList.Images.Add(kv.Value ?? Placeholder());
-                                if (kv.Value != null) kv.Value.Dispose();
-                                var name = Path.GetFileName(kv.Key.Path);
-                                var it = new ListViewItem(name, idx)
-                                {
-                                    ToolTipText = kv.Key.Path + "\r\n" + Util.FormatSize(kv.Key.Size)
-                                };
-                                lvImages.Items.Add(it);
-                            }
-                            lvImages.EndUpdate();
-                            loadedImages += thumbs.Count;
-                            UpdateImgCount();
-                            btnMore.Enabled = loadedImages < filteredImages.Count;
-                        }
-                        btnMore.Text = "Tải thêm 200 ảnh";
-                        thumbBusy = false;
+                        if (g != gen) { if (bmp != null) bmp.Dispose(); return; }
+                        Store(idx, bmp);
+                        var r = CellRect(idx);
+                        if (r.Bottom >= 0 && r.Top <= ClientSize.Height) Invalidate(r);
                     });
                 }
-                catch { thumbBusy = false; }
-            });
+                catch { if (bmp != null) bmp.Dispose(); }
+            }
         }
 
-        static Bitmap _placeholder;
-        static Bitmap Placeholder()
+        // Cache LRU: giu toi da CacheMax thumbnail, don bot cai o xa vung nhin
+        void Store(int idx, Bitmap bmp)
         {
-            if (_placeholder == null)
+            Bitmap old;
+            if (cache.TryGetValue(idx, out old) && old != null) old.Dispose();
+            cache[idx] = bmp;
+            LinkedListNode<int> node;
+            if (lruMap.TryGetValue(idx, out node)) lru.Remove(node);
+            lruMap[idx] = lru.AddFirst(idx);
+            if (cache.Count > CacheMax) Evict();
+        }
+
+        void Touch(int idx)
+        {
+            LinkedListNode<int> node;
+            if (lruMap.TryGetValue(idx, out node) && node != lru.First)
             {
-                _placeholder = new Bitmap(110, 110);
-                using (var g = Graphics.FromImage(_placeholder))
-                {
-                    g.Clear(Color.FromArgb(235, 238, 242));
-                    TextRenderer.DrawText(g, "?", new Font("Segoe UI", 28f),
-                        new Rectangle(0, 0, 110, 110), Color.Gray,
-                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-                }
+                lru.Remove(node);
+                lruMap[idx] = lru.AddFirst(idx);
             }
-            return _placeholder;
+        }
+
+        void Evict()
+        {
+            int anc = anchor, keep = ColsCount * 8;
+            var node = lru.Last;
+            while (cache.Count > CacheMax - 150 && node != null)
+            {
+                var prev = node.Previous;
+                int i = node.Value;
+                if (Math.Abs(i - anc) > keep)
+                {
+                    lru.Remove(node);
+                    lruMap.Remove(i);
+                    Bitmap b;
+                    if (cache.TryGetValue(i, out b) && b != null) b.Dispose();
+                    cache.Remove(i);
+                }
+                node = prev;
+            }
         }
 
         static Bitmap MakeThumb(string path, int w, int h)
@@ -1160,15 +1495,123 @@ namespace DiskUsage
             catch { return null; }
         }
 
-        // ------------------------------------------------------------- Utils
-        static void TryOpenExplorer(string path)
+        // ------------------------------------------------------ Chuot & phim
+        int HitTest(Point p)
         {
-            try { Process.Start("explorer.exe", "\"" + path + "\""); } catch { }
+            if (items.Count == 0) return -1;
+            int cols = ColsCount;
+            if (p.X < 4 || p.X >= 4 + cols * CellW) return -1;
+            int col = (p.X - 4) / CellW;
+            int row = (p.Y + scrollY - 4) / CellH;
+            if (row < 0) return -1;
+            int i = row * cols + col;
+            return i < items.Count ? i : -1;
         }
 
-        static void TrySelectInExplorer(string path)
+        protected override void OnMouseDown(MouseEventArgs e)
         {
-            try { Process.Start("explorer.exe", "/select,\"" + path + "\""); } catch { }
+            base.OnMouseDown(e);
+            Focus();
+            int i = HitTest(e.Location);
+            if (i != selected) { selected = i; Invalidate(); }
+        }
+
+        protected override void OnMouseDoubleClick(MouseEventArgs e)
+        {
+            base.OnMouseDoubleClick(e);
+            int i = HitTest(e.Location);
+            if (i >= 0 && ItemActivate != null) ItemActivate(i);
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            ScrollTo(scrollY - Math.Sign(e.Delta) * CellH);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int i = HitTest(e.Location);
+            if (i != tipIndex)
+            {
+                tipIndex = i;
+                tip.SetToolTip(this, i >= 0
+                    ? items[i].Path + "\r\n" + Util.FormatSize(items[i].Size) : "");
+            }
+        }
+
+        void ScrollTo(int y)
+        {
+            int max = Math.Max(0, TotalHeight - ClientSize.Height);
+            y = Math.Max(0, Math.Min(max, y));
+            if (y == scrollY) return;
+            scrollY = y;
+            if (vbar.Value != y) vbar.Value = y; else Invalidate();
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            switch (keyData & Keys.KeyCode)
+            {
+                case Keys.Up: case Keys.Down: case Keys.Left: case Keys.Right:
+                case Keys.PageUp: case Keys.PageDown: case Keys.Home: case Keys.End:
+                case Keys.Enter:
+                    return true;
+            }
+            return base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (items.Count == 0) return;
+            int cols = ColsCount;
+            int rowsPage = Math.Max(1, ClientSize.Height / CellH);
+            int i = selected < 0 ? 0 : selected;
+            switch (e.KeyCode)
+            {
+                case Keys.Left: i--; break;
+                case Keys.Right: i++; break;
+                case Keys.Up: i -= cols; break;
+                case Keys.Down: i += cols; break;
+                case Keys.PageUp: i -= cols * rowsPage; break;
+                case Keys.PageDown: i += cols * rowsPage; break;
+                case Keys.Home: i = 0; break;
+                case Keys.End: i = items.Count - 1; break;
+                case Keys.Enter:
+                    if (selected >= 0 && ItemActivate != null) ItemActivate(selected);
+                    return;
+                default: return;
+            }
+            e.Handled = true;
+            i = Math.Max(0, Math.Min(items.Count - 1, i));
+            if (i != selected)
+            {
+                selected = i;
+                EnsureVisible(i);
+                Invalidate();
+            }
+        }
+
+        void EnsureVisible(int i)
+        {
+            var r = CellRect(i);
+            if (r.Top < 4) ScrollTo(scrollY + r.Top - 4);
+            else if (r.Bottom > ClientSize.Height) ScrollTo(scrollY + r.Bottom - ClientSize.Height + 4);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                gen++;
+                lock (sync) pending.Clear();
+                foreach (var b in cache.Values) if (b != null) b.Dispose();
+                cache.Clear(); lru.Clear(); lruMap.Clear();
+                tip.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 
