@@ -584,7 +584,7 @@ namespace DiskUsage
             };
             numPageSize = new NumericUpDown
             {
-                Minimum = 10, Maximum = 2000, Value = 200, Increment = 50,
+                Minimum = 12, Maximum = 2000, Value = 36, Increment = 12,
                 Width = 65, Margin = new Padding(0, 3, 14, 0),
                 TextAlign = HorizontalAlignment.Right
             };
@@ -1221,13 +1221,16 @@ namespace DiskUsage
 
         const int CellW = 128, CellH = 152, Thumb = 110;
         const int CacheMax = 900; // so thumbnail giu trong RAM (~40 MB)
-        static readonly int MaxWorkers = Math.Max(2, Math.Min(4, Environment.ProcessorCount - 1));
+        // it worker + uu tien thap: khong tranh CPU voi luong UI -> khong treo app
+        static readonly int MaxWorkers = Math.Max(1, Math.Min(3, Environment.ProcessorCount - 2));
 
         List<FileEntry> items = new List<FileEntry>();
         readonly Dictionary<int, Bitmap> cache = new Dictionary<int, Bitmap>();
         readonly LinkedList<int> lru = new LinkedList<int>();
         readonly Dictionary<int, LinkedListNode<int>> lruMap = new Dictionary<int, LinkedListNode<int>>();
         readonly HashSet<int> pending = new HashSet<int>();
+        // thumbnail giai ma xong duoc gom vao day, UI timer nhat theo lo
+        readonly Queue<KeyValuePair<int, Bitmap>> done = new Queue<KeyValuePair<int, Bitmap>>();
         readonly object sync = new object();
         int workers;
         int gen;            // tang moi lan SetItems -> huy ket qua tai tre
@@ -1238,6 +1241,7 @@ namespace DiskUsage
         VScrollBar vbar;
         ToolTip tip = new ToolTip();
         int tipIndex = -1;
+        System.Windows.Forms.Timer pump;
 
         public ThumbGrid()
         {
@@ -1247,18 +1251,30 @@ namespace DiskUsage
             vbar = new VScrollBar { Dock = DockStyle.Right };
             vbar.ValueChanged += delegate { scrollY = vbar.Value; Invalidate(); };
             Controls.Add(vbar);
+            // gom ket qua tu worker roi ve mot lan, tranh doi BeginInvoke lam nghen UI
+            pump = new System.Windows.Forms.Timer { Interval = 80 };
+            pump.Tick += delegate { DrainDone(); };
+            pump.Start();
         }
 
         public int SelectedIndex { get { return selected; } }
 
         public void SetItems(List<FileEntry> list)
         {
-            gen++;
+            lock (sync)
+            {
+                gen++;
+                pending.Clear();
+                while (done.Count > 0)
+                {
+                    var kv = done.Dequeue();
+                    if (kv.Value != null) kv.Value.Dispose();
+                }
+            }
             items = list ?? new List<FileEntry>();
             selected = -1;
             tipIndex = -1;
             anchor = 0;
-            lock (sync) pending.Clear();
             foreach (var b in cache.Values) if (b != null) b.Dispose();
             cache.Clear(); lru.Clear(); lruMap.Clear();
             scrollY = 0;
@@ -1386,7 +1402,12 @@ namespace DiskUsage
                 while (workers < MaxWorkers && pending.Count > 0)
                 {
                     workers++;
-                    Task.Run((Action)PumpLoader);
+                    var t = new Thread(PumpLoader)
+                    {
+                        IsBackground = true,
+                        Priority = ThreadPriority.BelowNormal
+                    };
+                    t.Start();
                 }
             }
         }
@@ -1416,18 +1437,29 @@ namespace DiskUsage
                 }
 
                 var bmp = MakeThumb(path, Thumb, Thumb);
-                try
+                lock (sync)
                 {
-                    BeginInvoke((Action)delegate
-                    {
-                        if (g != gen) { if (bmp != null) bmp.Dispose(); return; }
-                        Store(idx, bmp);
-                        var r = CellRect(idx);
-                        if (r.Bottom >= 0 && r.Top <= ClientSize.Height) Invalidate(r);
-                    });
+                    if (g != gen) { if (bmp != null) bmp.Dispose(); }
+                    else done.Enqueue(new KeyValuePair<int, Bitmap>(idx, bmp));
                 }
-                catch { if (bmp != null) bmp.Dispose(); }
             }
+        }
+
+        // Chay tren luong UI (timer): nhat ca lo thumbnail da xong, ve mot lan
+        void DrainDone()
+        {
+            List<KeyValuePair<int, Bitmap>> batch = null;
+            lock (sync)
+            {
+                if (done.Count > 0)
+                {
+                    batch = new List<KeyValuePair<int, Bitmap>>(done);
+                    done.Clear();
+                }
+            }
+            if (batch == null) return;
+            foreach (var kv in batch) Store(kv.Key, kv.Value);
+            Invalidate();
         }
 
         // Cache LRU: giu toi da CacheMax thumbnail, don bot cai o xa vung nhin
@@ -1472,6 +1504,8 @@ namespace DiskUsage
             }
         }
 
+        const int PropertyTagThumbnailData = 0x501B;
+
         static Bitmap MakeThumb(string path, int w, int h)
         {
             try
@@ -1479,16 +1513,35 @@ namespace DiskUsage
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 using (var img = Image.FromStream(fs, false, false))
                 {
+                    // Uu tien thumbnail EXIF nhung san (vai KB) thay vi giai ma
+                    // ca anh goc nhieu MB -> nhanh hon nhieu voi anh chup
+                    Image src = img;
+                    Image embedded = null;
+                    try
+                    {
+                        foreach (int id in img.PropertyIdList)
+                        {
+                            if (id != PropertyTagThumbnailData) continue;
+                            var pi = img.GetPropertyItem(PropertyTagThumbnailData);
+                            if (pi != null && pi.Value != null && pi.Value.Length > 0)
+                                embedded = Image.FromStream(new MemoryStream(pi.Value));
+                            break;
+                        }
+                    }
+                    catch { }
+                    if (embedded != null) src = embedded;
+
                     var bmp = new Bitmap(w, h);
                     using (var g = Graphics.FromImage(bmp))
                     {
                         g.Clear(Color.FromArgb(24, 28, 34));
                         g.InterpolationMode = InterpolationMode.Bilinear;
-                        double scale = Math.Min((double)w / img.Width, (double)h / img.Height);
-                        int dw = Math.Max(1, (int)(img.Width * scale));
-                        int dh = Math.Max(1, (int)(img.Height * scale));
-                        g.DrawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+                        double scale = Math.Min((double)w / src.Width, (double)h / src.Height);
+                        int dw = Math.Max(1, (int)(src.Width * scale));
+                        int dh = Math.Max(1, (int)(src.Height * scale));
+                        g.DrawImage(src, (w - dw) / 2, (h - dh) / 2, dw, dh);
                     }
+                    if (embedded != null) embedded.Dispose();
                     return bmp;
                 }
             }
@@ -1605,8 +1658,18 @@ namespace DiskUsage
         {
             if (disposing)
             {
-                gen++;
-                lock (sync) pending.Clear();
+                pump.Stop();
+                pump.Dispose();
+                lock (sync)
+                {
+                    gen++;
+                    pending.Clear();
+                    while (done.Count > 0)
+                    {
+                        var kv = done.Dequeue();
+                        if (kv.Value != null) kv.Value.Dispose();
+                    }
+                }
                 foreach (var b in cache.Values) if (b != null) b.Dispose();
                 cache.Clear(); lru.Clear(); lruMap.Clear();
                 tip.Dispose();
