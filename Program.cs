@@ -405,6 +405,11 @@ namespace DiskUsage
             {
                 if (!scanning && IsHandleCreated) TryLoadImageCache();
             };
+            // Khi go tay xong (roi o nhap) cung thu nap cache cua duong dan do
+            cboDrive.Leave += delegate
+            {
+                if (!scanning && IsHandleCreated) TryLoadImageCache();
+            };
             Load += delegate { TryLoadImageCache(); };
         }
 
@@ -421,14 +426,23 @@ namespace DiskUsage
 
             var lbl = new Label
             {
-                Text = "Ổ đĩa:", AutoSize = true, Location = new Point(12, 14),
+                Text = "Ổ đĩa / thư mục:", AutoSize = true, Location = new Point(12, 14),
                 BackColor = Color.Transparent, ForeColor = Aero.TextMain
             };
             cboDrive = new ComboBox
             {
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                Location = new Point(62, 10), Width = 340,
+                DropDownStyle = ComboBoxStyle.DropDown,   // cho phep go tay duong dan
+                Location = new Point(120, 10), Width = 282,
                 Font = new Font("Segoe UI", 9.75f)
+            };
+            // Enter trong o duong dan = bam Quet
+            cboDrive.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Enter)
+                {
+                    e.Handled = e.SuppressKeyPress = true;
+                    if (!scanning) ToggleScan();
+                }
             };
             btnBrowse = MakeButton("Chọn thư mục…", new Point(412, 9), 120);
             btnBrowse.Click += delegate { BrowseFolder(); };
@@ -804,26 +818,63 @@ namespace DiskUsage
 
         void BrowseFolder()
         {
-            using (var dlg = new FolderBrowserDialog
-                { Description = "Chọn thư mục cần phân tích dung lượng" })
+            string cur = (cboDrive.Text ?? "").Trim().Trim('"');
+            string init = cur.Length > 0 && Directory.Exists(cur) ? cur : null;
+
+            // Hop thoai kieu Vista: co thanh dia chi + o "Folder:" de go/dan duong dan
+            string picked;
+            if (FolderPicker.TryPick(Handle, init,
+                    "Chọn thư mục cần phân tích dung lượng", out picked))
             {
-                if (dlg.ShowDialog(this) == DialogResult.OK)
+                if (string.IsNullOrEmpty(picked)) return; // nguoi dung bam Huy
+            }
+            else
+            {
+                // OS cu khong ho tro -> quay ve hop thoai truyen thong
+                using (var dlg = new FolderBrowserDialog
+                    { Description = "Chọn thư mục cần phân tích dung lượng" })
                 {
-                    var item = new DriveItem { Path = dlg.SelectedPath, Label = "📂 " + dlg.SelectedPath };
-                    cboDrive.Items.Add(item);
-                    cboDrive.SelectedItem = item;
+                    if (init != null) dlg.SelectedPath = init;
+                    if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                    picked = dlg.SelectedPath;
                 }
             }
+
+            var item = new DriveItem { Path = picked, Label = "📂 " + picked };
+            cboDrive.Items.Add(item);
+            cboDrive.SelectedItem = item;
+        }
+
+        // Phan giai duong dan can quet: uu tien muc chon trong list, neu khong
+        // lay text nguoi dung go (bo dau nhay, khoang trang, dau \ thua)
+        string ResolveScanPath()
+        {
+            var item = cboDrive.SelectedItem as DriveItem;
+            string text = (cboDrive.Text ?? "").Trim().Trim('"');
+            if (item != null && string.Equals(cboDrive.Text, item.Label, StringComparison.Ordinal))
+                return item.Path;
+            if (text.Length == 0) return null;
+            // "D:" -> "D:\"; giu nguyen UNC \\server\share
+            if (text.Length == 2 && text[1] == ':') text += "\\";
+            else if (text.Length > 3) text = text.TrimEnd('\\');
+            return text;
         }
 
         // --------------------------------------------------------------- Scan
         void ToggleScan()
         {
             if (scanning) { if (cts != null) cts.Cancel(); return; }
-            var item = cboDrive.SelectedItem as DriveItem;
-            if (item == null) { MessageBox.Show(this, "Hãy chọn ổ đĩa hoặc thư mục."); return; }
+            string path = ResolveScanPath();
+            if (string.IsNullOrEmpty(path))
+            { MessageBox.Show(this, "Hãy chọn ổ đĩa hoặc nhập đường dẫn thư mục."); return; }
+            if (!Directory.Exists(path))
+            {
+                MessageBox.Show(this, "Không tìm thấy thư mục:\r\n" + path,
+                    "Đường dẫn không hợp lệ", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
-            scanPath = item.Path;
+            scanPath = path;
             scanning = true;
             btnScan.Text = "■  Dừng";
             btnBrowse.Enabled = false;
@@ -1202,11 +1253,11 @@ namespace DiskUsage
 
         void TryLoadImageCache()
         {
-            var item = cboDrive.SelectedItem as DriveItem;
-            if (item == null) return;
+            string path = ResolveScanPath();
+            if (string.IsNullOrEmpty(path)) return;
             try
             {
-                string file = ImageCacheFile(item.Path);
+                string file = ImageCacheFile(path);
                 if (!File.Exists(file)) return;
                 var list = new List<FileEntry>();
                 DateTime when = DateTime.MinValue;
@@ -1926,6 +1977,115 @@ namespace DiskUsage
             if (b >= 1048576L) return string.Format("{0:0.##} MB", b / 1048576.0);
             if (b >= 1024L) return string.Format("{0:0.#} KB", b / 1024.0);
             return b + " B";
+        }
+    }
+
+    // -------------------------------------------------------- FolderPicker
+    // Hop thoai chon thu muc kieu Vista qua COM IFileOpenDialog: co thanh dia
+    // chi va o "Folder:" cho phep go/dan truc tiep duong dan (khac han
+    // FolderBrowserDialog cu chi co cay thu muc).
+    static class FolderPicker
+    {
+        const uint FOS_PICKFOLDERS = 0x20;
+        const uint FOS_FORCEFILESYSTEM = 0x40;
+        const uint FOS_PATHMUSTEXIST = 0x800;
+        const uint SIGDN_FILESYSPATH = 0x80058000;
+
+        // true = da dung duoc hop thoai Vista (path = ket qua, "" = Huy)
+        // false = OS khong ho tro -> goi y dung fallback
+        public static bool TryPick(IntPtr owner, string initialPath, string title, out string path)
+        {
+            path = "";
+            IFileOpenDialog dlg = null;
+            try { dlg = (IFileOpenDialog)new FileOpenDialogRCW(); }
+            catch { return false; }
+
+            try
+            {
+                uint opts;
+                dlg.GetOptions(out opts);
+                dlg.SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+                if (!string.IsNullOrEmpty(title)) dlg.SetTitle(title);
+
+                if (!string.IsNullOrEmpty(initialPath))
+                {
+                    IShellItem start;
+                    if (SHCreateItemFromParsingName(initialPath, IntPtr.Zero,
+                            typeof(IShellItem).GUID, out start) == 0 && start != null)
+                    {
+                        dlg.SetFolder(start);
+                        Marshal.ReleaseComObject(start);
+                    }
+                }
+
+                int hr = dlg.Show(owner);
+                if (hr != 0) return true; // Huy hoac dong -> path = ""
+
+                IShellItem result;
+                if (dlg.GetResult(out result) == 0 && result != null)
+                {
+                    string p;
+                    result.GetDisplayName(SIGDN_FILESYSPATH, out p);
+                    Marshal.ReleaseComObject(result);
+                    path = p ?? "";
+                }
+                return true;
+            }
+            catch { return false; }
+            finally { Marshal.ReleaseComObject(dlg); }
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHCreateItemFromParsingName(string pszPath, IntPtr pbc,
+            [MarshalAs(UnmanagedType.LPStruct)] Guid riid, out IShellItem ppv);
+
+        [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")]
+        class FileOpenDialogRCW { }
+
+        [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"),
+         InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IShellItem
+        {
+            [PreserveSig] int BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+            [PreserveSig] int GetParent(out IShellItem ppsi);
+            [PreserveSig] int GetDisplayName(uint sigdnName,
+                [MarshalAs(UnmanagedType.LPWStr)] out string ppszName);
+            [PreserveSig] int GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+            [PreserveSig] int Compare(IShellItem psi, uint hint, out int piOrder);
+        }
+
+        // Khai bao phang toan bo vtable (IModalWindow -> IFileDialog ->
+        // IFileOpenDialog) theo dung thu tu; chi vai method duoc dung.
+        [ComImport, Guid("d57c7288-d4ad-4768-be02-9d969532d960"),
+         InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IFileOpenDialog
+        {
+            [PreserveSig] int Show(IntPtr parent);
+            [PreserveSig] int SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
+            [PreserveSig] int SetFileTypeIndex(uint iFileType);
+            [PreserveSig] int GetFileTypeIndex(out uint piFileType);
+            [PreserveSig] int Advise(IntPtr pfde, out uint pdwCookie);
+            [PreserveSig] int Unadvise(uint dwCookie);
+            [PreserveSig] int SetOptions(uint fos);
+            [PreserveSig] int GetOptions(out uint pfos);
+            [PreserveSig] int SetDefaultFolder(IShellItem psi);
+            [PreserveSig] int SetFolder(IShellItem psi);
+            [PreserveSig] int GetFolder(out IShellItem ppsi);
+            [PreserveSig] int GetCurrentSelection(out IShellItem ppsi);
+            [PreserveSig] int SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+            [PreserveSig] int GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+            [PreserveSig] int SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+            [PreserveSig] int SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+            [PreserveSig] int SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+            [PreserveSig] int GetResult(out IShellItem ppsi);
+            [PreserveSig] int AddPlace(IShellItem psi, int fdap);
+            [PreserveSig] int SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
+            [PreserveSig] int Close(int hr);
+            [PreserveSig] int SetClientGuid(ref Guid guid);
+            [PreserveSig] int ClearClientData();
+            [PreserveSig] int SetFilter(IntPtr pFilter);
+            [PreserveSig] int GetResults(out IntPtr ppenum);
+            [PreserveSig] int GetSelectedItems(out IntPtr ppsai);
         }
     }
 }
