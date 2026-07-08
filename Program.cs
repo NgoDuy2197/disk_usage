@@ -42,7 +42,7 @@ namespace DiskUsage
         public List<FolderNode> Children = new List<FolderNode>();
     }
 
-    class FileEntry { public string Path; public long Size; }
+    class FileEntry { public string Path; public long Size; public bool IsVideo; }
     class ExtStat { public long Size; public long Count; }
 
     class NodeInfo
@@ -88,6 +88,16 @@ namespace DiskUsage
 
         static readonly HashSet<string> ImgExt = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".ico" };
+
+        static readonly HashSet<string> VidExt = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        { ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+          ".mpg", ".mpeg", ".3gp", ".ts", ".vob" };
+
+        public static bool IsVideoPath(string path)
+        {
+            int dot = path.LastIndexOf('.');
+            return dot >= 0 && VidExt.Contains(path.Substring(dot));
+        }
 
         public long TotalFiles, TotalDirs, TotalBytes, DeniedDirs;
         public volatile string CurrentPath = "";
@@ -208,8 +218,9 @@ namespace DiskUsage
             Interlocked.Add(ref st.Size, size);
             Interlocked.Increment(ref st.Count);
 
-            if (ImgExt.Contains(ext))
-                Images.Add(new FileEntry { Path = full, Size = size });
+            bool isVid = VidExt.Contains(ext);
+            if (isVid || ImgExt.Contains(ext))
+                Images.Add(new FileEntry { Path = full, Size = size, IsVideo = isVid });
 
             if (size > _minTop || _topCount < TOP_N)
             {
@@ -343,7 +354,7 @@ namespace DiskUsage
         ListView lvFolders, lvBigFiles, lvExt;
 
         ThumbGrid grid;
-        ComboBox cboMinSize;
+        ComboBox cboMinSize, cboMediaType;
         Label lblImgCount;
         NumericUpDown numPageSize, numPage;
         Button btnPrev, btnNext;
@@ -555,8 +566,8 @@ namespace DiskUsage
             tlp.Controls.Add(grids, 0, 2);
             tpSum.Controls.Add(tlp);
 
-            // ---- Tab 3: Hinh anh
-            var tpImg = new TabPage("  Hình ảnh  ") { BackColor = Aero.PaneBack };
+            // ---- Tab 3: Anh & Video
+            var tpImg = new TabPage("  Ảnh && Video  ") { BackColor = Aero.PaneBack };
             var imgTop = new FlowLayoutPanel
             {
                 Dock = DockStyle.Top, Height = 40, Padding = new Padding(8, 7, 0, 0),
@@ -576,6 +587,15 @@ namespace DiskUsage
                 { "Tất cả kích cỡ", "≥ 100 KB", "≥ 500 KB", "≥ 1 MB", "≥ 5 MB" });
             cboMinSize.SelectedIndex = 1;
             cboMinSize.SelectedIndexChanged += delegate { ApplyImageFilter(); };
+
+            cboMediaType = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList, Width = 110,
+                Margin = new Padding(0, 2, 10, 0)
+            };
+            cboMediaType.Items.AddRange(new object[] { "Ảnh & video", "Chỉ ảnh", "Chỉ video" });
+            cboMediaType.SelectedIndex = 0;
+            cboMediaType.SelectedIndexChanged += delegate { ApplyImageFilter(); };
 
             var lblPs = new Label
             {
@@ -616,6 +636,7 @@ namespace DiskUsage
             btnNext.Click += delegate { ShowPage(pageIndex + 1); };
 
             imgTop.Controls.Add(lblImgCount);
+            imgTop.Controls.Add(cboMediaType);
             imgTop.Controls.Add(cboMinSize);
             imgTop.Controls.Add(lblPs);
             imgTop.Controls.Add(numPageSize);
@@ -628,17 +649,27 @@ namespace DiskUsage
             grid.ItemActivate += delegate(int idx)
             {
                 int g = pageStart + idx;
-                if (g >= 0 && g < filteredImages.Count)
-                    using (var f = new PreviewForm(filteredImages, g))
-                        f.ShowDialog(this);
+                if (g < 0 || g >= filteredImages.Count) return;
+                if (filteredImages[g].IsVideo)
+                {
+                    try { Process.Start(filteredImages[g].Path); } catch { }
+                    return;
+                }
+                using (var f = new PreviewForm(filteredImages, g))
+                    f.ShowDialog(this);
             };
             var cmsImg = new ContextMenuStrip();
-            cmsImg.Items.Add("Xem ảnh", null, delegate
+            cmsImg.Items.Add("Xem / Phát", null, delegate
             {
                 var fe = SelectedImage();
-                if (fe != null)
-                    using (var f = new PreviewForm(filteredImages, pageStart + grid.SelectedIndex))
-                        f.ShowDialog(this);
+                if (fe == null) return;
+                if (fe.IsVideo)
+                {
+                    try { Process.Start(fe.Path); } catch { }
+                    return;
+                }
+                using (var f = new PreviewForm(filteredImages, pageStart + grid.SelectedIndex))
+                    f.ShowDialog(this);
             });
             cmsImg.Items.Add("Mở trong Explorer", null, delegate
             {
@@ -1095,7 +1126,14 @@ namespace DiskUsage
         void ApplyImageFilter()
         {
             long min = MinSizes[Math.Max(0, cboMinSize.SelectedIndex)];
-            filteredImages = allImages.Where(delegate(FileEntry f) { return f.Size >= min; }).ToList();
+            int mt = cboMediaType.SelectedIndex; // 0: ca hai, 1: chi anh, 2: chi video
+            filteredImages = allImages.Where(delegate(FileEntry f)
+            {
+                if (f.Size < min) return false;
+                if (mt == 1) return !f.IsVideo;
+                if (mt == 2) return f.IsVideo;
+                return true;
+            }).ToList();
             ShowPage(0);
         }
 
@@ -1126,11 +1164,11 @@ namespace DiskUsage
         {
             if (filteredImages.Count == 0)
             {
-                lblImgCount.Text = "0 ảnh.";
+                lblImgCount.Text = "0 mục.";
                 return;
             }
             int last = Math.Min(filteredImages.Count, pageStart + PageSize);
-            lblImgCount.Text = string.Format("{0:N0} ảnh · hiển thị {1:N0}–{2:N0}",
+            lblImgCount.Text = string.Format("{0:N0} mục · hiển thị {1:N0}–{2:N0}",
                 filteredImages.Count, pageStart + 1, last);
         }
 
@@ -1184,14 +1222,15 @@ namespace DiskUsage
                         if (sep <= 0) continue;
                         long sz;
                         if (!long.TryParse(line.Substring(0, sep), out sz)) continue;
-                        list.Add(new FileEntry { Path = line.Substring(sep + 1), Size = sz });
+                        string p = line.Substring(sep + 1);
+                        list.Add(new FileEntry { Path = p, Size = sz, IsVideo = Scanner.IsVideoPath(p) });
                     }
                 }
                 if (list.Count == 0) return;
                 allImages = list; // da sap xep giam dan khi luu
                 ApplyImageFilter();
                 lblStatus.Text = string.Format(
-                    "Đã nạp {0:N0} ảnh từ cache{1} — bấm Quét để cập nhật dữ liệu mới.",
+                    "Đã nạp {0:N0} mục ảnh/video từ cache{1} — bấm Quét để cập nhật dữ liệu mới.",
                     list.Count,
                     when > DateTime.MinValue ? " (quét lúc " + when.ToString("dd/MM/yyyy HH:mm") + ")" : "");
             }
@@ -1345,7 +1384,7 @@ namespace DiskUsage
             g.Clear(Color.White);
             if (items.Count == 0)
             {
-                TextRenderer.DrawText(g, "Không có ảnh.", Font, ClientRectangle,
+                TextRenderer.DrawText(g, "Không có ảnh/video nào.", Font, ClientRectangle,
                     Aero.TextDim, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 return;
             }
@@ -1359,6 +1398,7 @@ namespace DiskUsage
         {
             var cell = CellRect(i);
             var thumbRect = new Rectangle(cell.X + (CellW - Thumb) / 2, cell.Y + 4, Thumb, Thumb);
+            var fe = items[i];
 
             if (i == selected) Aero.DrawSelection(g, cell);
 
@@ -1373,14 +1413,33 @@ namespace DiskUsage
             {
                 using (var br = new SolidBrush(Color.FromArgb(238, 242, 246)))
                     g.FillRectangle(br, thumbRect);
-                // "…" = dang tai, "✕" = doc loi (tep hong/da xoa)
-                TextRenderer.DrawText(g, have ? "✕" : "…", Font, thumbRect, Aero.TextDim,
+                // "…" = dang tai; loi doc: video hien "▶", anh hien "✕"
+                TextRenderer.DrawText(g, have ? (fe.IsVideo ? "▶" : "✕") : "…",
+                    Font, thumbRect, Aero.TextDim,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             }
             using (var pen = new Pen(Color.FromArgb(214, 222, 230)))
                 g.DrawRectangle(pen, thumbRect);
 
-            var fe = items[i];
+            // badge "phat" cho video
+            if (fe.IsVideo && have && bmp != null)
+            {
+                var badge = new Rectangle(thumbRect.X + 5, thumbRect.Bottom - 25, 20, 20);
+                var old = g.SmoothingMode;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var bbr = new SolidBrush(Color.FromArgb(170, 0, 0, 0)))
+                    g.FillEllipse(bbr, badge);
+                var tri = new Point[]
+                {
+                    new Point(badge.X + 8, badge.Y + 5),
+                    new Point(badge.X + 8, badge.Y + 15),
+                    new Point(badge.X + 16, badge.Y + 10)
+                };
+                using (var wbr = new SolidBrush(Color.White))
+                    g.FillPolygon(wbr, tri);
+                g.SmoothingMode = old;
+            }
+
             var nameRect = new Rectangle(cell.X + 3, thumbRect.Bottom + 3, CellW - 6, 16);
             TextRenderer.DrawText(g, Path.GetFileName(fe.Path), Font, nameRect, Aero.TextMain,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
@@ -1417,7 +1476,7 @@ namespace DiskUsage
             while (true)
             {
                 int idx = -1, g;
-                string path = null;
+                FileEntry fe = null;
                 lock (sync)
                 {
                     g = gen;
@@ -1431,12 +1490,14 @@ namespace DiskUsage
                         }
                         pending.Remove(idx);
                         var list = items;
-                        if (idx >= 0 && idx < list.Count) path = list[idx].Path;
+                        if (idx >= 0 && idx < list.Count) fe = list[idx];
                     }
-                    if (path == null) { workers--; return; }
+                    if (fe == null) { workers--; return; }
                 }
 
-                var bmp = MakeThumb(path, Thumb, Thumb);
+                var bmp = fe.IsVideo
+                    ? ShellThumb(fe.Path, Thumb, Thumb)   // video: nho Windows Shell tao thumbnail
+                    : MakeThumb(fe.Path, Thumb, Thumb);
                 lock (sync)
                 {
                     if (g != gen) { if (bmp != null) bmp.Dispose(); }
@@ -1501,6 +1562,66 @@ namespace DiskUsage
                     cache.Remove(i);
                 }
                 node = prev;
+            }
+        }
+
+        // --------------------------- Thumbnail video qua Windows Shell (nhu Explorer)
+        [StructLayout(LayoutKind.Sequential)]
+        struct SIZE_ { public int cx, cy; public SIZE_(int x, int y) { cx = x; cy = y; } }
+
+        [ComImport, Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b"),
+         InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IShellItemImageFactory
+        {
+            [PreserveSig]
+            int GetImage(SIZE_ size, int flags, out IntPtr phbm);
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHCreateItemFromParsingName(string pszPath, IntPtr pbc,
+            ref Guid riid, out IShellItemImageFactory ppv);
+
+        [DllImport("gdi32.dll")]
+        static extern bool DeleteObject(IntPtr hObject);
+
+        const int SIIGBF_BIGGERSIZEOK = 0x01;
+
+        static Bitmap ShellThumb(string path, int w, int h)
+        {
+            IShellItemImageFactory factory = null;
+            try
+            {
+                var iid = typeof(IShellItemImageFactory).GUID;
+                if (SHCreateItemFromParsingName(path, IntPtr.Zero, ref iid, out factory) != 0
+                    || factory == null)
+                    return null;
+                IntPtr hbm;
+                if (factory.GetImage(new SIZE_(w, h), SIIGBF_BIGGERSIZEOK, out hbm) != 0
+                    || hbm == IntPtr.Zero)
+                    return null;
+                try
+                {
+                    using (var raw = Image.FromHbitmap(hbm))
+                    {
+                        var bmp = new Bitmap(w, h);
+                        using (var g = Graphics.FromImage(bmp))
+                        {
+                            g.Clear(Color.FromArgb(24, 28, 34));
+                            g.InterpolationMode = InterpolationMode.Bilinear;
+                            double scale = Math.Min((double)w / raw.Width, (double)h / raw.Height);
+                            int dw = Math.Max(1, (int)(raw.Width * scale));
+                            int dh = Math.Max(1, (int)(raw.Height * scale));
+                            g.DrawImage(raw, (w - dw) / 2, (h - dh) / 2, dw, dh);
+                        }
+                        return bmp;
+                    }
+                }
+                finally { DeleteObject(hbm); }
+            }
+            catch { return null; }
+            finally
+            {
+                if (factory != null) Marshal.ReleaseComObject(factory);
             }
         }
 
@@ -1764,6 +1885,14 @@ namespace DiskUsage
             pb.Image = null;
             if (old != null) old.Dispose();
             var fe = list[idx];
+            if (fe.IsVideo)
+            {
+                lblInfo.Text = string.Format(
+                    "🎬 {0}   ·   video   ·   {1}   ·   [{2}/{3}]  —  nháy đúp hoặc bấm \"Mở tệp\" để phát",
+                    Path.GetFileName(fe.Path), Util.FormatSize(fe.Size), idx + 1, list.Count);
+                Text = fe.Path;
+                return;
+            }
             try
             {
                 var bytes = File.ReadAllBytes(fe.Path);
